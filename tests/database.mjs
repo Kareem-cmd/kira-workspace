@@ -1,0 +1,44 @@
+import {PGlite} from '@electric-sql/pglite';
+import assert from 'node:assert/strict';
+import fs from 'node:fs/promises';
+const db=new PGlite();
+await db.exec(`create role anon; create role authenticated; create schema auth; create table auth.users(id uuid primary key,email text,email_confirmed_at timestamptz); create function auth.uid() returns uuid language sql as $$ select nullif(current_setting('request.jwt.claim.sub',true),'')::uuid $$;`);
+const sql=(await fs.readFile(new URL('../supabase/migrations/202610080001_kira_workspace.sql',import.meta.url),'utf8')).replace('create extension if not exists pgcrypto;','');
+await db.exec(sql);
+const ids={admin:'00000000-0000-4000-8000-000000000001',sales:'00000000-0000-4000-8000-000000000002',delivery:'00000000-0000-4000-8000-000000000003',outsider:'00000000-0000-4000-8000-000000000004'};
+for(const [role,id] of Object.entries(ids)){await db.query('insert into auth.users values($1,$2,now())',[id,role+'@example.test']);if(role!=='outsider')await db.query('insert into public.kira_members(email,name,role) values($1,$2,$3)',[role+'@example.test',role,role]);}
+async function as(role){await db.exec('set role authenticated');await db.query("select set_config('request.jwt.claim.sub',$1,false)",[ids[role]||'']);}
+async function call(payload){return (await db.query('select public.kira_save($1::jsonb) result',[JSON.stringify(payload)])).rows[0].result;}
+async function state(){return (await db.query('select public.kira_workspace() result')).rows[0].result;}
+const owner='admin@example.test';const save=(kind,data,clientId='',extra={})=>call({kind,data,clientId,owner,...extra});
+let count=0;async function rejects(fn,pattern){await assert.rejects(fn,pattern);count++;}
+await as('outsider');await rejects(state,/غير مضاف/);
+await as('admin');assert.equal((await state()).me.role,'admin');count++;
+await rejects(()=>db.query('select * from public.kira_records'),/permission denied/);
+await rejects(()=>db.query("select public.kira_total('{}'::jsonb)"),/permission denied/);
+const c=await save('client',{name:'شركة اختبار',status:'محتمل'});count++;
+await save('settings',{name:'Kira Studio'});
+const draft={title:'فاتورة',docKind:'invoice',currency:'EGP',items:[{name:'خدمة',qty:2,price:1000.25,details:'تجربة'}],discount:100,taxRate:14,status:'صادر',date:'2026-10-08'};
+const doc=await save('document',draft,c.id);
+let snapshot=await state(),d=snapshot.rows.find(r=>r.id===doc.id);assert.equal(d.data.clientSnapshot.name,'شركة اختبار');assert.ok(d.data.number.startsWith('KR-INV-'));count++;
+await rejects(()=>save('document',d.data,c.id,{id:d.id,version:d.version}),/ثابت/);
+await save('payment',{documentId:d.id,amount:1000,date:'2026-10-08',method:'تحويل بنكي'},c.id);
+await rejects(()=>save('payment',{documentId:d.id,amount:1200,date:'2026-10-08',method:'تحويل بنكي'},c.id),/أكبر من المتبقي/);
+await rejects(()=>save('document',{...draft,items:[{name:'سيئ',qty:-1,price:100}]},c.id),/خارج الحدود/);
+await rejects(()=>save('document',{...draft,discount:5000},c.id),/الخصم أكبر/);
+await rejects(()=>save('deal',{title:'سيئ',value:-1,currency:'EGP',stage:'جديد'},c.id),/خارج الحدود/);
+const task=await save('task',{title:'متابعة',status:'مفتوحة',priority:'عادية'},c.id);
+let t=(await state()).rows.find(r=>r.id===task.id);await save('task',{...t.data,status:'مكتملة'},c.id,{id:t.id,version:t.version});await rejects(()=>save('task',t.data,c.id,{id:t.id,version:t.version}),/عدّل شخص آخر/);
+const historical=await save('deal',{title:'مستورد',value:100,currency:'EGP',stage:'مكتسبة',imported:true},c.id);assert.equal((await state()).rows.find(r=>r.id===historical.id).data.closedAt,'');count++;
+const salesClient=await save('client',{name:'عميل المبيعات',status:'نشط'},'',{owner:'sales@example.test'});
+await as('sales');snapshot=await state();assert.equal(snapshot.rows.some(r=>r.id===c.id),false);assert.equal(snapshot.rows.some(r=>r.id===salesClient.id),true);count++;
+await rejects(()=>save('document',draft,salesClient.id),/الفواتير للحسابات/);
+await rejects(()=>call({action:'member',member:{email:'hack@example.test',name:'اختبار',role:'admin',active:1}}),/للمدير فقط/);
+await rejects(()=>save('note',{title:'غير مصرح',channel:'ملاحظة'},c.id),/اختر عميلًا/);
+await as('admin');await save('task',{title:'تسليم',status:'مفتوحة',priority:'عادية'},c.id,{owner:'delivery@example.test'});
+await as('delivery');snapshot=await state();assert.ok(snapshot.rows.some(r=>r.id===c.id));assert.ok(!snapshot.rows.some(r=>['document','payment','deal'].includes(r.kind)));count++;
+await rejects(()=>save('client',{name:'غير مسموح',status:'نشط'}),/غير مسموح/);
+await as('admin');await rejects(()=>call({action:'member',member:{email:owner,name:'admin',role:'sales',active:1}}),/لا يمكنك/);
+assert.ok((await state()).activities.length>0);count++;
+console.log(`PASS: ${count} database checks — permissions, outsider denial, direct-access denial, document snapshots, immutable documents, payment limits, validation, concurrency versions and historical imports.`);
+await db.close();
